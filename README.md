@@ -11,7 +11,7 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-FF6B35?style=flat-square)](https://langchain-ai.github.io/langgraph)
 [![Milvus](https://img.shields.io/badge/Milvus-2.4+-00A1EA?style=flat-square&logo=milvus&logoColor=white)](https://milvus.io)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docker.com)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 
 [快速开始](#-快速开始) · [系统架构](#-系统架构) · [API 文档](#-api-接口速查) · [部署指南](#-生产部署) · [开发指南](#-开发指南)
 
