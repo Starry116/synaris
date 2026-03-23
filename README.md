@@ -553,7 +553,7 @@ docker compose down -v   # 删除所有容器和数据卷
 
 <div align="center">
 
-**Synaris · 赛纳睿智能平台**
+**Synaris**
 
 *Built with ❤️ by the Synaris Team*
 
