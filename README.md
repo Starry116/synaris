@@ -1,7 +1,6 @@
 <div align="center">
 
 # SYNARIS
-### 赛纳睿智能平台
 
 **Enterprise RAG & Multi-Agent AI Platform**
 
@@ -21,7 +20,7 @@
 
 ## 📖 项目简介
 
-**Synaris（赛纳睿）** 是一个基于 FastAPI + LangChain + LangGraph + Milvus 构建的**企业级 RAG 与多 Agent 智能协作平台**。
+**Synaris** 是一个基于 FastAPI + LangChain + LangGraph + Milvus 构建的**企业级 RAG 与多 Agent 智能协作平台**。
 
 为企业内部提供三大核心能力：
 
