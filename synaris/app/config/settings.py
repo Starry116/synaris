@@ -1,24 +1,29 @@
 """
-Synaris · 赛纳睿智能平台
-app/config/settings.py — 全局配置管理模块
+@File       : settings.py
+@Author     : Starry Hung
+@Created    : 2026-03-23
+@Version    : 1.0.0
+@Description: 全局配置管理模块。
+@Features:
+  - 基于 pydantic-settings 的全局配置管理系统，支持从 .env 文件读取环境变量
+  - 模块化配置分组：AppConfig（应用基础）、OpenAIConfig（大模型接口）、MilvusConfig（向量数据库）、
+    RedisConfig（缓存队列）、PostgresConfig（结构化数据库）、LogConfig（日志系统）、
+    SecurityConfig（认证安全）、CeleryConfig（异步任务队列）
+  - 聚合配置类 Settings，支持嵌套访问各分组配置
+  - 单例模式工厂函数 get_settings()，确保配置在进程生命周期内只解析一次
+  - 安全处理敏感信息：使用 SecretStr 类型防止密钥泄露
+  - 字段验证器：启动阶段校验配置有效性，实现 Fail Fast
+  - 自定义属性方法：如 cors_origins_list、get_api_key() 等便捷访问器
+  - 跨模块共享参数：RAG 文档处理参数、成本监控阈值等
+  - 配置冻结：防止运行时意外修改配置实例
+  - 环境变量约束：使用 Literal 类型限制可选值范围
 
-设计决策说明：
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  原则                     │  实现方式                           │
-  ├─────────────────────────────────────────────────────────────────┤
-  │  DRY（不重复自己）         │  _BaseEnvSettings 公共基类          │
-  │  Fail Fast（尽早失败）     │  必填项无默认值 + @field_validator   │
-  │  可读性                   │  TTL 用乘法（10 * 60）而非魔法数字   │
-  │  类型安全                  │  枚举字段用 Literal 约束             │
-  │  防意外修改                │  frozen=True 配置不可变              │
-  │  防日志泄露                │  敏感字段用 SecretStr               │
-  │  全进程单例                │  @lru_cache(maxsize=1)              │
-  └─────────────────────────────────────────────────────────────────┘
+@Project    : Synaris
+@License    : Apache License 2.0
 
-  不采纳的"常见建议"及原因：
-  - env_prefix：字段已带前缀（MILVUS_HOST），再加 prefix 会产生双重前缀 bug
-  - Redis 拆成 host/port/password：Synaris 用 Docker Compose 固定地址，URL 已够用
-  - MODEL_ROUTER 用 dict：env 里写 JSON 极难维护，改用独立字段 + llm_router 组装
+@ChangeLog:
+    2026-03-23  Starry  Initial creation
+
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 公共基类
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _BaseEnvSettings(BaseSettings):
     """所有配置分组的公共基类。
 
@@ -45,14 +51,15 @@ class _BaseEnvSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",    # 忽略不属于本分组的字段，避免跨组互相报错
-        frozen=True,       # 配置实例不可变，防止运行期被某个模块意外篡改
+        extra="ignore",  # 忽略不属于本分组的字段，避免跨组互相报错
+        frozen=True,  # 配置实例不可变，防止运行期被某个模块意外篡改
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AppConfig — 应用基础配置
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class AppConfig(_BaseEnvSettings):
     """FastAPI 应用基础配置。"""
@@ -85,6 +92,7 @@ class AppConfig(_BaseEnvSettings):
 # OpenAIConfig — 大模型接口配置
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class OpenAIConfig(_BaseEnvSettings):
     """OpenAI API 及多模型路由配置。
 
@@ -100,31 +108,27 @@ class OpenAIConfig(_BaseEnvSettings):
     # SecretStr：值在内存中加密存储，str() 输出 '**********'，防止日志泄露
     OPENAI_API_KEY: SecretStr = Field(description="OpenAI API 密钥，必填")
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
-    OPENAI_TIMEOUT: int = 60       # 单次请求超时（秒）
-    OPENAI_MAX_RETRIES: int = 3    # 请求失败最大重试次数
+    OPENAI_TIMEOUT: int = 60  # 单次请求超时（秒）
+    OPENAI_MAX_RETRIES: int = 3  # 请求失败最大重试次数
 
     # 模型路由（三档 + 兜底），在 core/llm_router.py 中按任务类型组装路由逻辑
     QUALITY_MODEL: str = "gpt-4o"
     DEFAULT_MODEL: str = "gpt-4o-mini"
     ECONOMY_MODEL: str = "gpt-3.5-turbo"
-    FALLBACK_MODEL: str = "gpt-3.5-turbo"   # 兜底必须 ≤ DEFAULT_MODEL 的成本
+    FALLBACK_MODEL: str = "gpt-3.5-turbo"  # 兜底必须 ≤ DEFAULT_MODEL 的成本
 
     # Embedding
     EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSIONS: int = 1536   # 必须与 Milvus Collection Schema 一致
+    EMBEDDING_DIMENSIONS: int = 1536  # 必须与 Milvus Collection Schema 一致
 
     @field_validator("OPENAI_API_KEY", mode="before")
     @classmethod
     def validate_api_key(cls, v: str) -> str:
         """启动阶段校验，而不是第一次 API 调用时才发现问题（Fail Fast）。"""
         if not v or not str(v).strip():
-            raise ValueError(
-                "OPENAI_API_KEY 未配置，请在 .env 文件中填写"
-            )
+            raise ValueError("OPENAI_API_KEY 未配置，请在 .env 文件中填写")
         if not str(v).startswith("sk-"):
-            raise ValueError(
-                "OPENAI_API_KEY 格式错误，合法的 key 以 'sk-' 开头"
-            )
+            raise ValueError("OPENAI_API_KEY 格式错误，合法的 key 以 'sk-' 开头")
         return v
 
     def get_api_key(self) -> str:
@@ -135,6 +139,7 @@ class OpenAIConfig(_BaseEnvSettings):
 # ─────────────────────────────────────────────────────────────────────────────
 # MilvusConfig — 向量数据库配置
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class MilvusConfig(_BaseEnvSettings):
     """Milvus 向量数据库配置。
@@ -176,6 +181,7 @@ class MilvusConfig(_BaseEnvSettings):
 # RedisConfig — 缓存与消息队列配置
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class RedisConfig(_BaseEnvSettings):
     """Redis 缓存、会话与 Pub/Sub 配置。
 
@@ -188,16 +194,16 @@ class RedisConfig(_BaseEnvSettings):
     缓存数据和 Celery 队列数据隔离，flush 或 debug 时互不影响。
     """
 
-    REDIS_URL: str = "redis://redis:6379/0"           # 主缓存（Docker 服务名 redis）
-    REDIS_CELERY_URL: str = "redis://redis:6379/1"    # Celery Broker，独立 db 隔离
+    REDIS_URL: str = "redis://redis:6379/0"  # 主缓存（Docker 服务名 redis）
+    REDIS_CELERY_URL: str = "redis://redis:6379/1"  # Celery Broker，独立 db 隔离
     REDIS_MAX_CONNECTIONS: int = 20
 
     # ── TTL 配置（单位：秒）──────────────────────────────────────────────────
     # 用乘法表达：10 * 60 比魔法数字 600 更直观，reviewer 一眼能看出业务意图
-    CACHE_TTL_SHORT: int = 10 * 60            # 600s    检索结果缓存
-    CACHE_TTL_LONG: int = 24 * 60 * 60        # 86400s  Embedding 缓存
-    CACHE_TTL_SESSION: int = 2 * 60 * 60      # 7200s   聊天历史缓存
-    CACHE_TTL_TASK: int = 1 * 60 * 60         # 3600s   任务上下文缓存
+    CACHE_TTL_SHORT: int = 10 * 60  # 600s    检索结果缓存
+    CACHE_TTL_LONG: int = 24 * 60 * 60  # 86400s  Embedding 缓存
+    CACHE_TTL_SESSION: int = 2 * 60 * 60  # 7200s   聊天历史缓存
+    CACHE_TTL_TASK: int = 1 * 60 * 60  # 3600s   任务上下文缓存
 
     # 聊天历史最大保留条数，超出后自动丢弃最早的消息（滑动窗口）
     CHAT_HISTORY_MAX_MESSAGES: int = 20
@@ -216,21 +222,23 @@ class RedisConfig(_BaseEnvSettings):
 # PostgresConfig — 结构化数据库配置
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class PostgresConfig(_BaseEnvSettings):
     """PostgreSQL 异步数据库配置（asyncpg + SQLAlchemy 2.0）。"""
 
     POSTGRES_URL: str = (
         "postgresql+asyncpg://synaris:synaris_pass@postgres:5432/synaris"
     )
-    POSTGRES_POOL_SIZE: int = 10        # 连接池常驻连接数
-    POSTGRES_MAX_OVERFLOW: int = 20     # 超出池大小后允许的最大额外连接数
-    POSTGRES_POOL_TIMEOUT: int = 30     # 等待可用连接的超时时间（秒）
-    POSTGRES_ECHO: bool = False         # 是否打印 SQL，仅用于本地调试，生产必须 False
+    POSTGRES_POOL_SIZE: int = 10  # 连接池常驻连接数
+    POSTGRES_MAX_OVERFLOW: int = 20  # 超出池大小后允许的最大额外连接数
+    POSTGRES_POOL_TIMEOUT: int = 30  # 等待可用连接的超时时间（秒）
+    POSTGRES_ECHO: bool = False  # 是否打印 SQL，仅用于本地调试，生产必须 False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LogConfig — 日志配置
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class LogConfig(_BaseEnvSettings):
     """日志系统配置。
@@ -253,6 +261,7 @@ class LogConfig(_BaseEnvSettings):
 # SecurityConfig — 认证与安全配置
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class SecurityConfig(_BaseEnvSettings):
     """JWT 与 API Key 认证配置。"""
 
@@ -266,9 +275,7 @@ class SecurityConfig(_BaseEnvSettings):
     @classmethod
     def validate_secret_key(cls, v: str) -> str:
         if not v or not str(v).strip():
-            raise ValueError(
-                "SECRET_KEY 未配置，请执行 `openssl rand -hex 32` 生成"
-            )
+            raise ValueError("SECRET_KEY 未配置，请执行 `openssl rand -hex 32` 生成")
         if len(str(v)) < 32:
             raise ValueError(
                 f"SECRET_KEY 长度为 {len(str(v))} 字符，至少需要 32 字符以保证安全性"
@@ -284,24 +291,26 @@ class SecurityConfig(_BaseEnvSettings):
 # CeleryConfig — 异步任务队列配置
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class CeleryConfig(_BaseEnvSettings):
     """Celery 任务队列配置。"""
 
-    CELERY_WORKER_CONCURRENCY: int = 4      # Worker 并发进程数
-    CELERY_TASK_MAX_RETRIES: int = 3        # 失败最大重试次数
-    CELERY_TASK_RETRY_BACKOFF: int = 60     # 指数退避基础间隔（秒）
-                                            # 实际间隔 = backoff × 2^(n-1)
-                                            # 第1次重试: 60s, 第2次: 120s, 第3次: 240s
+    CELERY_WORKER_CONCURRENCY: int = 4  # Worker 并发进程数
+    CELERY_TASK_MAX_RETRIES: int = 3  # 失败最大重试次数
+    CELERY_TASK_RETRY_BACKOFF: int = 60  # 指数退避基础间隔（秒）
+    # 实际间隔 = backoff × 2^(n-1)
+    # 第1次重试: 60s, 第2次: 120s, 第3次: 240s
 
     # 三优先级队列名称常量，在 task_queue.py 中引用
-    QUEUE_HIGH: str = "high_priority"       # Agent 实时任务
-    QUEUE_DEFAULT: str = "default"          # 文档处理
-    QUEUE_LOW: str = "low_priority"         # 评估、统计等离线任务
+    QUEUE_HIGH: str = "high_priority"  # Agent 实时任务
+    QUEUE_DEFAULT: str = "default"  # 文档处理
+    QUEUE_LOW: str = "low_priority"  # 评估、统计等离线任务
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings — 聚合主配置类
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class Settings(_BaseEnvSettings):
     """Synaris 全局配置聚合类。
@@ -331,17 +340,18 @@ class Settings(_BaseEnvSettings):
     celery: CeleryConfig = Field(default_factory=CeleryConfig)
 
     # ── RAG 文档处理参数（跨模块共享，放顶层便于访问）──────────────────────
-    CHUNK_SIZE: int = 512       # 文档分块大小（字符数）
-    CHUNK_OVERLAP: int = 50     # 相邻分块重叠字符数，防止语义在块边界处截断
-    RAG_RERANK_TOP_K: int = 3   # Reranking 后实际注入 Prompt 的文档数量
+    CHUNK_SIZE: int = 512  # 文档分块大小（字符数）
+    CHUNK_OVERLAP: int = 50  # 相邻分块重叠字符数，防止语义在块边界处截断
+    RAG_RERANK_TOP_K: int = 3  # Reranking 后实际注入 Prompt 的文档数量
 
     # ── 成本监控 ────────────────────────────────────────────────────────────
-    COST_ALERT_DAILY_USD: float = 50.0   # 日费用告警阈值（美元），超出写 WARNING 日志
+    COST_ALERT_DAILY_USD: float = 50.0  # 日费用告警阈值（美元），超出写 WARNING 日志
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 单例工厂
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
