@@ -2,74 +2,43 @@
 @File       : supervisor.py
 @Author     : Starry Hung
 @Created    : 2026-03-24
-@Version    : 1.0.0
+@Version    : 1.0.9
 @Description: LangGraph 多 Agent Supervisor 编排器。
 @Features:
-  - SupervisorState(TypedDict): 独立于 AgentState 的 Supervisor 专属状态容器，
-    承载任务分解计划、Worker 执行结果、修订轮次等
-  - AssignmentRecord: 单条 Worker 任务分配记录（含依赖关系 depends_on）
-  - WorkerResult: 单个 Worker 的执行结果（含评审分数、verdict）
-  - 3 个图节点:
-      · decompose_node  — LLM 将主任务分解为结构化 assignments[]
-      · dispatch_node   — 依赖感知调度器，串行/并行执行各 Worker
-      · merge_node      — 整合所有 Worker 结果，生成最终交付内容
-  - 两种调度模式（执行模式由 LLM 自动决定，也可 override）:
-      · sequential — 严格按 depends_on 拓扑顺序逐个执行
-      · parallel   — 同一依赖层级的 Worker 并发 asyncio.gather() 执行
-  - 依赖感知调度算法: 拓扑排序 + 层级批次执行，同层并发，跨层串行
-  - ReviewerAgent 触发重写机制:
-      verdict=needs_revision → 自动追加新 WriterAgent 任务（最多 max_revisions 次）
-      verdict=rejected       → 记录问题后继续（不阻塞整体流程）
-  - 统一错误处理: Worker 失败不终止整体，降级为错误占位符继续 merge
-  - run_supervisor() 异步入口: 对外统一调用接口
-
-  ┌────────────────────────────────────────────────────────────────────────┐
-  │                    Supervisor 状态机完整流转图                           │
-  │                                                                         │
-  │   ┌─────────┐                                                           │
-  │   │  START  │                                                           │
-  │   └────┬────┘                                                           │
-  │        │ run_supervisor(task)                                           │
-  │        ▼                                                                │
-  │   ┌──────────────────┐                                                  │
-  │   │  decompose_node  │  LLM 分析主任务                                  │
-  │   │                  │  → assignments[] (agent/instruction/depends_on)  │
-  │   │                  │  → execution_mode (sequential/parallel)          │
-  │   └────────┬─────────┘                                                  │
-  │            │ 固定边                                                      │
-  │            ▼                                                            │
-  │   ┌──────────────────┐                                                  │
-  │   │  dispatch_node   │  依赖感知调度器                                   │
-  │   │                  │  ┌─ parallel ─┐  同层任务 asyncio.gather()        │
-  │   │                  │  │ Layer 0    │→ [ResearchAgent, ...]            │
-  │   │                  │  │ Layer 1    │→ [WriterAgent] (依赖 Layer 0)    │
-  │   │                  │  │ Layer 2    │→ [ReviewerAgent] (依赖 Layer 1)  │
-  │   │                  │  └────────────┘                                  │
-  │   └────────┬─────────┘                                                  │
-  │            │                                                            │
-  │     ┌──────┴───────────────────────────┐                               │
-  │     │                                  │                               │
-  │  verdict=needs_revision           all_done=True                        │
-  │  revision_count < max             (或 revision 上限)                    │
-  │     │                                  │                               │
-  │     │  追加新 WriterAgent 任务           │ 固定边                        │
-  │     └──→ dispatch_node (再次执行)       ▼                               │
-  │                                  ┌──────────────┐                      │
-  │                                  │  merge_node  │  LLM 整合所有结果     │
-  │                                  │              │  → final_output       │
-  │                                  └──────┬───────┘                      │
-  │                                         │ 固定边                        │
-  │                                         ▼                              │
-  │                                      ┌─────┐                           │
-  │                                      │ END │                           │
-  │                                      └─────┘                           │
-  └────────────────────────────────────────────────────────────────────────┘
+  - SupervisorState: 状态容器（assignments / results / execution_mode）
+  - AssignmentRecord: 任务定义（agent / instruction / depends_on）
+  - WorkerResult: 执行结果（output / score / verdict）
+  - Nodes:
+      · decompose_node  → 任务拆解（LLM → assignments + mode）
+      · dispatch_node   → 拓扑调度执行（sequential | parallel）
+      · merge_node      → 汇总结果生成 final_output
+  - Scheduling:
+      · DAG 拓扑排序 + 分层批执行
+      · sequential：按依赖顺序执行
+      · parallel：同层 asyncio.gather()
+  - Review Loop:
+      · needs_revision → 追加 Writer 任务重试
+      · rejected       → 记录问题继续流程
+      · max_revision   → 限制循环次数
+  - Fault Tolerance:
+      · Worker 失败 → 降级占位结果，继续 merge
+  - Entry:
+      · run_supervisor(task): 异步统一入口
 
 @Project    : Synaris
 @License    : Apache License 2.0
 
 @ChangeLog:
-    2026-03-24  Starry  Initial creation
+    2026-03-24  Starry  实现 supervisorState（TypedDict）、assignmentRecord（任务单元）、workerResult（执行结果容器）
+    2026-03-25  Starry  实现 assignment：priority、status、elapsed_ms、is_revision
+    2026-03-26  Starry  实现 DAG 调度算法（_build_execution_layers）和 worker 调用逻辑（_call_worker）
+    2026-03-27  Starry  实现_call_worker() 核心执行函数，包含超时处理和异常捕获
+    2026-03-28  Starry  完成 reviewer JSON 输出解析，支持 needs_revision 触发重试
+    2026-03-29  Starry  实现 _route_after_dispatch() 路由函数，更新状态并触发 merge
+    2026-03-30  Starry  实现 merge_node() 生成最终结果，并完成 run_supervisor() 入口函数
+    2026-03-31  Starry  1、集成测试 supervisor 流程，覆盖正常执行、Worker 失败、Reviewer 返修等；
+                        2、增加 debug/info 输出
+    2026-04-01  Starry  完善代码注释
 """
 
 from __future__ import annotations
