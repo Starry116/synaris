@@ -213,27 +213,10 @@ class AgentConfig(BaseModel):
 class AgentState(TypedDict, total=False):
     """
     LangGraph StateGraph 的核心状态字典。
-
-    设计原则 —— 类比一部舞台剧的执行档案：
-    ┌─────────────────────────────────────────────────────┐
-    │  messages        → 演员台词本（对话历史，只增不减）    │
-    │  task            → 本场演出主题（用户原始任务）        │
-    │  plan            → 导演分镜表（Planner 生成的步骤）    │
-    │  current_step    → 正在演第几幕（当前步骤索引）        │
-    │  tool_results    → 道具间反馈（工具调用结果列表）      │
-    │  final_answer    → 谢幕词（最终交付给用户的回答）      │
-    │  status          → 场务状态板（任务当前状态）          │
-    │  error           → NG 记录单（异常信息）               │
-    │  iteration_count → 已循环轮次（防死循环计数器）        │
-    │  interrupt       → 中场暂停单（Human-in-the-Loop）     │
-    │  memory_context  → 记忆注入区（Step 23 由 Memory 填充）│
-    │  metadata        → 演出手册（trace_id / config 等）    │
-    └─────────────────────────────────────────────────────┘
-
-    ⚠️  messages 字段使用 Annotated[list, operator.add] 声明 reducer：
-        这是 LangGraph 并发安全写入的关键机制。
-        多个节点并发向 messages 追加时，框架会自动合并而不是覆盖。
-        其余字段默认采用「最后写入覆盖（last-wins）」语义。
+    messages 字段使用 Annotated[list, operator.add] 声明 reducer：
+    这是 LangGraph 并发安全写入的关键机制。
+    多个节点并发向 messages 追加时，框架会自动合并而不是覆盖。
+    其余字段默认采用「最后写入覆盖（last-wins）」语义。
     """
 
     # ── 对话历史（append-only，由 LangGraph reducer 保证并发安全）─
