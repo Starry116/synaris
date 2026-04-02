@@ -1,0 +1,207 @@
+# =============================================================================
+# docker-compose.prod.yml — Synaris 生产环境覆盖配置
+#
+# 使用方式（叠加到基础配置上，不是单独运行）：
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# 与开发环境的核心差异：
+#   1. app 副本数 2（配合 Nginx upstream 做负载均衡）
+#   2. 全部服务 restart: always（崩溃自动重启，开发是 unless-stopped）
+#   3. 资源限制（CPU + Memory），防止单服务耗尽宿主机资源
+#   4. 移除源码热挂载（镜像内已包含代码，不需要 bind mount）
+#   5. 生产级日志格式（JSON）
+#   6. 关闭 Swagger UI（避免接口信息泄露）
+#   7. Celery Worker 并发数提升到 8
+#
+# 生产部署前必须完成的准备：
+#   1. 设置所有 ${...} 环境变量（使用 .env 文件或 Secrets Manager）
+#   2. 生成强随机 SECRET_KEY（openssl rand -hex 32）
+#   3. 配置 SSL 证书（取消 nginx volumes 中的注释）
+#   4. 确认 OPENAI_API_KEY 有足够额度
+# =============================================================================
+
+services:
+
+  # ── FastAPI 主服务（生产规格）──────────────────────────────────────────────
+  app:
+    deploy:
+      # 2 个副本，Nginx upstream 轮询负载均衡
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"        # 单副本最多使用 1 个 CPU 核
+          memory: 2G         # 单副本最多 2GB 内存（LangGraph 状态 + 模型缓存）
+        reservations:
+          cpus: "0.5"        # 保证至少 0.5 核可用
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    environment:
+      APP_WORKERS:  "2"        # uvicorn 多进程（每副本 2 个 worker）
+      LOG_FORMAT:   json       # 生产环境 JSON 日志（ELK / CloudWatch 兼容）
+      LOG_LEVEL:    warning    # 生产减少日志量（只记录警告及以上）
+      ENVIRONMENT:  production
+      # 关闭 Swagger UI（安全考虑）
+      DISABLE_DOCS: "true"
+    volumes:
+      # 生产环境不挂载源码（代码已 COPY 进镜像）
+      # 仅保留日志卷（方便宿主机收集）
+      - app_logs:/app/logs
+    restart: always
+
+  # ── Celery Worker（生产规格）──────────────────────────────────────────────
+  celery_worker:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"        # Worker 是 CPU 密集型（文档处理 + LLM 调用）
+          memory: 3G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+    command: >
+      celery -A app.infrastructure.task_queue.celery_app worker
+      --loglevel=warning
+      --concurrency=8
+      --queues=high,default,low
+      --hostname=worker@%h
+      --max-tasks-per-child=200
+      --prefetch-multiplier=1
+    environment:
+      LOG_FORMAT:  json
+      LOG_LEVEL:   warning
+      ENVIRONMENT: production
+    volumes:
+      - app_logs:/app/logs
+    restart: always
+
+  # ── Celery Flower（生产规格）──────────────────────────────────────────────
+  celery_flower:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 256M
+    restart: always
+
+  # ── Redis（生产规格）──────────────────────────────────────────────────────
+  redis:
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+      --loglevel warning
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 2G
+        reservations:
+          memory: 512M
+    restart: always
+
+  # ── PostgreSQL（生产规格）────────────────────────────────────────────────
+  postgres:
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=32MB
+      -c maintenance_work_mem=256MB
+      -c max_connections=200
+      -c wal_level=replica
+      -c max_wal_senders=3
+      -c log_min_duration_statement=500
+      -c log_line_prefix='%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+    restart: always
+
+  # ── Milvus（生产规格）────────────────────────────────────────────────────
+  milvus:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G          # Milvus 内存索引较吃资源，给足空间
+        reservations:
+          cpus: "1.0"
+          memory: 4G
+    restart: always
+
+  # ── etcd（生产规格）──────────────────────────────────────────────────────
+  etcd:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    restart: always
+
+  # ── MinIO（生产规格）─────────────────────────────────────────────────────
+  minio:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    restart: always
+
+  # ── Nginx（生产规格）─────────────────────────────────────────────────────
+  nginx:
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_logs:/var/log/nginx
+      # ⚠️ 生产环境必须挂载真实 SSL 证书
+      - /etc/ssl/certs/synaris.crt:/etc/nginx/certs/server.crt:ro
+      - /etc/ssl/private/synaris.key:/etc/nginx/certs/server.key:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    restart: always
+
+  # ── Prometheus（生产规格）────────────────────────────────────────────────
+  prometheus:
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"    # 生产保留 30 天
+      - "--web.enable-lifecycle"
+      - "--web.listen-address=:9090"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    restart: always
+
+  # ── Grafana（生产规格）───────────────────────────────────────────────────
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_USER:              ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD:          ${GRAFANA_PASSWORD}
+      GF_SECURITY_SECRET_KEY:              ${GRAFANA_SECRET_KEY}
+      GF_USERS_ALLOW_SIGN_UP:             "false"
+      GF_ANALYTICS_REPORTING_ENABLED:      "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES:      "false"
+      GF_SERVER_ROOT_URL:                  https://${DOMAIN}/grafana
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 512M
+    restart: always

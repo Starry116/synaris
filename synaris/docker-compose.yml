@@ -1,0 +1,421 @@
+# =============================================================================
+# docker-compose.yml — Synaris 开发环境服务编排
+#
+# 服务总览（10个，按依赖层次从底到顶排列）：
+#
+#   基础存储层（无依赖）
+#     etcd       — Milvus 元数据存储（分布式 KV）
+#     minio      — Milvus 对象存储（S3 兼容）
+#     redis      — 缓存 + Celery Broker + Pub/Sub
+#     postgres   — 结构化数据（用户/任务/Prompt版本）
+#
+#   向量数据库层（依赖 etcd + minio）
+#     milvus     — 向量检索引擎
+#
+#   应用服务层（依赖所有存储）
+#     app            — FastAPI 主服务
+#     celery_worker  — Celery 后台 Worker（文档处理/Agent任务）
+#     celery_flower  — Celery 任务监控 Web UI
+#
+#   网关与监控层
+#     nginx      — 反向代理 + 负载均衡 + WebSocket 代理
+#     prometheus — 指标采集（抓取 /metrics）
+#     grafana    — 可视化仪表盘
+#
+# 快速启动：
+#   cp .env.example .env          # 填写 OPENAI_API_KEY 等
+#   docker-compose up -d          # 启动全部服务
+#   docker-compose logs -f app    # 查看应用日志
+#
+# 端口一览：
+#   80    — Nginx（HTTP 入口）
+#   8000  — FastAPI（直接访问，调试用）
+#   6379  — Redis
+#   5432  — PostgreSQL
+#   19530 — Milvus gRPC
+#   9001  — MinIO Console
+#   5555  — Celery Flower
+#   9090  — Prometheus
+#   3000  — Grafana
+# =============================================================================
+
+x-common-env: &common-env        # YAML 锚点：所有服务共用的环境变量
+  REDIS_URL:          redis://redis:6379/0
+  MILVUS_HOST:        milvus
+  MILVUS_PORT:        "19530"
+  POSTGRES_HOST:      postgres
+  POSTGRES_PORT:      "5432"
+  POSTGRES_DB:        synaris
+  POSTGRES_USER:      synaris
+  POSTGRES_PASSWORD:  ${POSTGRES_PASSWORD:-synaris_dev}
+
+x-app-env: &app-env              # FastAPI / Celery 专用环境变量
+  <<: *common-env
+  OPENAI_API_KEY:         ${OPENAI_API_KEY}
+  OPENAI_BASE_URL:        ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  TAVILY_API_KEY:         ${TAVILY_API_KEY:-}
+  SECRET_KEY:             ${SECRET_KEY:-dev-secret-key-change-in-production}
+  LOG_LEVEL:              ${LOG_LEVEL:-info}
+  LOG_FORMAT:             ${LOG_FORMAT:-text}          # text（开发）/ json（生产）
+  ENVIRONMENT:            development
+  APP_VERSION:            3.0.0
+  MINIO_ENDPOINT:         minio:9000
+  MINIO_ACCESS_KEY:       ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY:       ${MINIO_SECRET_KEY:-minioadmin}
+  MINIO_BUCKET:           synaris-docs
+  CELERY_BROKER_URL:      redis://redis:6379/1
+  CELERY_RESULT_BACKEND:  redis://redis:6379/2
+
+services:
+
+  # ── etcd ─────────────────────────────────────────────────────────────────
+  # Milvus 依赖 etcd 存储集群元数据（Collection schema、索引配置等）
+  # 类比：etcd 是 Milvus 的「户籍登记处」
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: synaris_etcd
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"    # 4GB 配额
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - etcd_data:/bitnami/etcd
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── MinIO ─────────────────────────────────────────────────────────────────
+  # Milvus 依赖 MinIO 存储向量数据文件（S3 兼容协议）
+  # 同时也是 Synaris 文档原始文件的对象存储
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: synaris_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_DEFAULT_BUCKETS: synaris-docs,milvus-bucket
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # Web Console（访问 http://localhost:9001）
+    volumes:
+      - minio_data:/data
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  # 多重角色：
+  #   1. Embedding / 检索结果缓存（DB 0）
+  #   2. Celery Broker（DB 1）+ Result Backend（DB 2）
+  #   3. Agent 状态 Pub/Sub 频道
+  #   4. 会话历史（Short-term Memory）
+  redis:
+    image: redis:7-alpine
+    container_name: synaris_redis
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --loglevel notice
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  # 存储：用户账号 / API Key / 任务记录 / Prompt 版本 / Token 成本
+  postgres:
+    image: postgres:16-alpine
+    container_name: synaris_postgres
+    environment:
+      POSTGRES_DB:       synaris
+      POSTGRES_USER:     synaris
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-synaris_dev}
+      # 性能调优（开发环境）
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=128MB
+      -c max_connections=100
+      -c log_min_duration_statement=1000
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synaris -d synaris"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Milvus ────────────────────────────────────────────────────────────────
+  # 向量数据库：存储 Embedding 向量，提供 HNSW 语义检索
+  # standalone 模式：单节点，适合开发和中等规模生产
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: synaris_milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS:    etcd:2379
+      MINIO_ADDRESS:     minio:9000
+      MINIO_ACCESS_KEY:  ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY:  ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET_NAME: milvus-bucket
+      MINIO_USE_SSL:     "false"
+    ports:
+      - "19530:19530"    # gRPC API（SDK 连接端口）
+      - "9091:9091"      # HTTP metrics
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s    # Milvus 冷启动较慢，给足时间
+    restart: unless-stopped
+
+  # ── FastAPI 主服务 ────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime          # 使用 runtime 阶段（生产就绪镜像）
+    container_name: synaris_app
+    image: synaris:latest
+    environment:
+      <<: *app-env
+      APP_WORKERS: "1"         # 开发环境单 worker，生产覆盖为 2
+    ports:
+      - "8000:8000"            # 直接暴露，方便开发调试
+    volumes:
+      # 开发模式热重载：挂载源码（仅开发环境，生产删除此挂载）
+      - ./app:/app/app:ro
+      - app_logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Celery Worker ─────────────────────────────────────────────────────────
+  # 后台异步任务执行器：处理文档处理和 Agent 任务
+  # 三优先级队列：high（Agent实时）/ default（RAG查询）/ low（批量文档）
+  celery_worker:
+    image: synaris:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: synaris_celery_worker
+    command: >
+      celery -A app.infrastructure.task_queue.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --queues=high,default,low
+      --hostname=worker@%h
+      --max-tasks-per-child=100
+    environment:
+      <<: *app-env
+    volumes:
+      - ./app:/app/app:ro
+      - app_logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.infrastructure.task_queue.celery_app",
+             "inspect", "ping", "-d", "worker@$$HOSTNAME", "--timeout=5"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Celery Flower ─────────────────────────────────────────────────────────
+  # Celery 任务监控 Web UI：查看队列长度、任务状态、Worker 负载
+  # 访问：http://localhost:5555
+  celery_flower:
+    image: synaris:latest
+    container_name: synaris_celery_flower
+    command: >
+      celery -A app.infrastructure.task_queue.celery_app flower
+      --port=5555
+      --broker=redis://redis:6379/1
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    environment:
+      <<: *app-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
+    networks:
+      - synaris_net
+    restart: unless-stopped
+
+  # ── Nginx ─────────────────────────────────────────────────────────────────
+  # 职责：
+  #   - HTTP 反向代理（将 80 端口流量代理到 app:8000）
+  #   - WebSocket 代理（/agent/stream/* 的 Upgrade 处理）
+  #   - 静态文件服务（如有）
+  #   - SSL 终止（生产环境挂载证书）
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: synaris_nginx
+    ports:
+      - "80:80"
+      - "443:443"              # 预留 HTTPS，需挂载证书
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_logs:/var/log/nginx
+      # SSL 证书挂载（生产环境取消注释）
+      # - /etc/ssl/certs/synaris.crt:/etc/nginx/certs/server.crt:ro
+      # - /etc/ssl/private/synaris.key:/etc/nginx/certs/server.key:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - synaris_net
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  # 指标采集：每 15s 抓取 app:8000/metrics
+  # 访问：http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: synaris_prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"    # 保留 15 天数据
+      - "--web.enable-lifecycle"               # 允许热重载配置
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - synaris_net
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  # 可视化仪表盘：展示 P95 延迟 / Token 用量 / 缓存命中率 / Agent 耗时
+  # 访问：http://localhost:3000（默认 admin/admin）
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: synaris_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_PATHS_PROVISIONING:      /etc/grafana/provisioning
+      GF_SERVER_ROOT_URL:         http://localhost:3000
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana_dashboard.json:/etc/grafana/provisioning/dashboards/synaris.json:ro
+    depends_on:
+      - prometheus
+    networks:
+      - synaris_net
+    restart: unless-stopped
+
+
+# ── 网络 ──────────────────────────────────────────────────────────────────────
+networks:
+  synaris_net:
+    driver: bridge
+    name: synaris_network
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+
+# ── 数据卷 ─────────────────────────────────────────────────────────────────────
+volumes:
+  etcd_data:
+    name: synaris_etcd_data
+  minio_data:
+    name: synaris_minio_data
+  redis_data:
+    name: synaris_redis_data
+  postgres_data:
+    name: synaris_postgres_data
+  milvus_data:
+    name: synaris_milvus_data
+  app_logs:
+    name: synaris_app_logs
+  nginx_logs:
+    name: synaris_nginx_logs
+  prometheus_data:
+    name: synaris_prometheus_data
+  grafana_data:
+    name: synaris_grafana_data
