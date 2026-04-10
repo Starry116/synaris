@@ -47,7 +47,7 @@
 @License    : Apache License 2.0
 
 @ChangeLog:
-    2026-03-24  Starry  Initial creation
+    2026-04-01  Starry  Initial creation
     ⚠️  Step 20 补丁：POST /agent/run 改为提交 Celery 任务（替换 asyncio.create_task）
 """
 
