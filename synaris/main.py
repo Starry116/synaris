@@ -8,18 +8,17 @@
   - FastAPI 实例配置：标题 / 版本 / OpenAPI 路径 / lifespan
   - 中间件注册顺序（外层先执行）：
       CORS → TraceID 注入 → 请求日志 → slowapi 速率限制
-  - lifespan：启动时预热 Redis / Milvus 连接，关闭时优雅释放资源
+  - lifespan：启动时初始化 Redis / Milvus 连接，关闭时优雅释放资源
   - 路由挂载：/health / /chat / /knowledge / /rag / /agent
   - slowapi 速率限制：默认 60次/分钟/IP（可按用户配置覆盖）
   - 全局异常处理器：AppException → ApiResponse / 422 / 500 兜底
-  - Step 5 占位钩子：Auth 中间件（Step 19）/ /metrics 端点（Step 24）
-    标记 TODO，后续步骤按需补充，不影响当前构建
 
 @Project    : Synaris
 @License    : Apache License 2.0
 
 @ChangeLog:
     2026-03-23  Starry  Initial creation
+    2026-04-15  Starry  完成TODO列表中的所有功能，解除占位钩子注释
 """
 
 from __future__ import annotations
@@ -147,11 +146,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    应用生命周期管理。
+    生命周期管理。
 
     启动阶段（yield 之前）：
       1. 记录启动日志
-      2. 预热 Redis 连接池并执行 PING 健康检查
+      2. 初始化 Redis 连接池并执行 PING 健康检查
       3. 初始化 Milvus 连接并检查 Collection 状态
       4. （后续步骤）初始化 PostgreSQL 连接池
 
@@ -161,7 +160,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     # ── 启动 ────────────────────────────────────────────────────────────
     logger.info(
-        "Synaris 启动中",
+        "Synaris 启动ing...",
         extra={
             "app_name": settings.app_name,
             "version": settings.app_version,
@@ -170,44 +169,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         },
     )
 
-    # Redis 预热
+    # Redis 初始化
     try:
         from app.infrastructure.redis_client import get_client, ping as redis_ping
         _client = get_client()  # 触发连接池初始化
         redis_ok = await redis_ping()
         if redis_ok:
-            logger.info("Redis 连接就绪 ✓")
+            logger.info("Redis 连接OK")
         else:
             logger.warning("Redis PING 失败，服务降级运行")
     except Exception as exc:
         logger.error("Redis 初始化异常", extra={"error": str(exc)})
 
-    # Milvus 预热
+    # Milvus 初始化
     try:
         from app.infrastructure.milvus_client import get_milvus_client
         milvus_client = get_milvus_client()
         milvus_ok = await milvus_client.ping()
         if milvus_ok:
-            logger.info("Milvus 连接就绪 ✓")
+            logger.info("Milvus 连接OK")
         else:
             logger.warning("Milvus 连接失败，RAG 功能暂不可用")
     except Exception as exc:
         logger.error("Milvus 初始化异常", extra={"error": str(exc)})
 
-    # TODO(Step 21): 初始化 PostgreSQL 连接池
-    # from app.infrastructure.postgres_client import init_db
-    # await init_db()
-    # logger.info("PostgreSQL 连接就绪 ✓")
+    # 初始化 PostgreSQL 连接池
+    from app.infrastructure.postgres_client import init_db
+    await init_db()
+    logger.info("PostgreSQL 连接OK")
 
     logger.info(
-        "Synaris 启动完成，服务就绪",
+        "Synaris 启动OK，服务已就绪",
         extra={"api_prefix": settings.api_prefix},
     )
 
-    yield  # ← 应用正常运行期间挂起于此
+    yield  # ← 应用正常运行期间挂起于此（生命周期分割点：startup → runtime → shutdown）
 
     # ── 关闭 ────────────────────────────────────────────────────────────
-    logger.info("Synaris 关闭中，正在释放资源...")
+    logger.info("Synaris 关闭ing，正在释放资源...")
 
     try:
         from app.infrastructure.redis_client import close_pool
@@ -233,7 +232,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """
     FastAPI 应用工厂函数。
-    通过工厂模式便于测试时注入不同配置，同时保持 main.py 整洁。
     """
     app = FastAPI(
         title=settings.app_name,
@@ -275,17 +273,24 @@ def create_app() -> FastAPI:
     # ── 5. 请求日志
     app.add_middleware(RequestLoggingMiddleware)
 
-    # TODO(Step 19): 挂载 Auth 中间件
-    # from app.core.auth import AuthMiddleware
-    # app.add_middleware(AuthMiddleware)
+    # 挂载 Auth 中间件
+    from app.core.auth import AuthMiddleware
+    app.add_middleware(AuthMiddleware)
 
     # ── 路由挂载 ──────────────────────────────────────────────────────
     _mount_routers(app)
 
-    # TODO(Step 24): 注册 Prometheus /metrics 端点
-    # from app.core.observability import metrics_router
-    # app.include_router(metrics_router)
+    # 注册中间件
+    from app.core.observability import MetricsMiddleware
+    app.add_middleware(MetricsMiddleware)
+    
+    # 挂载 /metrics 端点
+    from app.core.observability import metrics_router
+    app.include_router(metrics_router)
 
+    # 在 lifespan 启动阶段
+    log_registered_metrics()
+    
     return app
 
 
@@ -297,21 +302,19 @@ def _mount_routers(app: FastAPI) -> None:
     from app.api.health import router as health_router
     app.include_router(health_router)                  # /health（无 prefix）
 
-    # 以下路由在对应 Step 完成后逐步取消注释
+    # AI聊天
+    from app.api.chat import router as chat_router
+    app.include_router(chat_router, prefix=settings.api_prefix)
 
-    # Step 7
-    # from app.api.chat import router as chat_router
-    # app.include_router(chat_router, prefix=settings.api_prefix)
+    # RAG 相关：知识库管理 + 向量搜索
+    from app.api.knowledge import router as knowledge_router
+    from app.api.rag import router as rag_router
+    app.include_router(knowledge_router, prefix=settings.api_prefix)
+    app.include_router(rag_router, prefix=settings.api_prefix)
 
-    # Step 11
-    # from app.api.knowledge import router as knowledge_router
-    # from app.api.rag import router as rag_router
-    # app.include_router(knowledge_router, prefix=settings.api_prefix)
-    # app.include_router(rag_router, prefix=settings.api_prefix)
-
-    # Step 16
-    # from app.api.agent import router as agent_router
-    # app.include_router(agent_router, prefix=settings.api_prefix)
+    # 智能体相关
+    from app.api.agent import router as agent_router
+    app.include_router(agent_router, prefix=settings.api_prefix)
 
 
 def _build_rate_limit_handler():
