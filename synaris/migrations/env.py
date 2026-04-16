@@ -46,6 +46,7 @@ from models.user           import User, APIKey           # noqa: F401
 from models.session        import ChatSession            # noqa: F401
 from models.task           import AgentTask              # noqa: F401
 from models.prompt_version import PromptVersion         # noqa: F401
+from models.eval_run       import EvaluationRun         # noqa: F401
 
 # ── Alembic Config ─────────────────────────────────────────────────────────────
 config = context.config
