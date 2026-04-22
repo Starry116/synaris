@@ -61,6 +61,9 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
+
 from infrastructure.postgres_client import get_db_session  # type: ignore[import]
 from models.user import APIKey, User, UserRole             # type: ignore[import]
 
@@ -849,3 +852,277 @@ def _auth_exception() -> HTTPException:
         detail={"code": 40100, "message": "认证失败，请检查凭证是否有效"},
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+# ── 中间件白名单路径（这些路径跳过一切认证探测）────────────────────────────
+_AUTH_SKIP_PREFIXES = (
+    "/health",
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/favicon.ico",
+    "/api/v1/openapi.json",   # FastAPI 自动生成的 Schema 端点
+)
+
+_auth_mw_logger = logging.getLogger("synaris.auth.middleware")
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    JWT / API Key 双认证注入中间件。
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │  职责定位：「软注入」而非「硬拦截」                            │
+    │                                                              │
+    │  中间件（本类）  → 探测凭证 → 注入 request.state.user         │
+    │  路由依赖项      → 读取 state.user → 决定是否拒绝请求          │
+    │                                                              │
+    │  类比：                                                       │
+    │    前台（中间件）识别客人身份，贴上姓名牌（state.user）;       │
+    │    贵宾室门卫（Depends）检查姓名牌，无牌拒绝进入。             │
+    └──────────────────────────────────────────────────────────────┘
+
+    注入到 request.state 的字段：
+
+      user        : Optional[User]
+          认证成功时的用户对象；未认证时为 None。
+
+      auth_method : str
+          认证方式标识："jwt" | "api_key" | "anonymous"
+          可在路由层通过 request.state.auth_method 读取，用于日志审计。
+
+      auth_error  : Optional[str]
+          认证失败的原因摘要（仅调试用，不对外暴露）。
+          例："jwt_expired" | "api_key_invalid" | "user_disabled"
+
+    注册方式（main.py）：
+        from app.core.auth import AuthMiddleware
+        app.add_middleware(AuthMiddleware)
+
+    路由层读取示例：
+        @router.get("/profile")
+        async def profile(request: Request):
+            user = request.state.user           # Optional[User]
+            method = request.state.auth_method  # "jwt" / "api_key" / "anonymous"
+            if user is None:
+                raise HTTPException(status_code=401)
+            ...
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next,
+    ) -> StarletteResponse:
+        """
+        中间件核心分发逻辑。
+
+        执行流程：
+          1. 白名单检查 → 直接放行（不做任何认证）
+          2. 尝试 JWT Bearer Token 认证
+          3. 若 JWT 失败，尝试 API Key 认证
+          4. 将认证结果写入 request.state
+          5. 调用下一个中间件或路由处理器
+        """
+        path = request.url.path
+
+        # ── 白名单路径直接放行 ─────────────────────────────────────────────
+        if any(path.startswith(prefix) for prefix in _AUTH_SKIP_PREFIXES):
+            _init_state(request, user=None, method="anonymous", error=None)
+            return await call_next(request)
+
+        # ── 初始化 state 为匿名（防止下游访问未定义属性报 AttributeError）──
+        _init_state(request, user=None, method="anonymous", error=None)
+
+        # ── 尝试路径 1：JWT Bearer Token ───────────────────────────────────
+        auth_header: str = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[len("Bearer "):]
+            if raw_token:
+                await self._try_jwt(request, raw_token)
+
+        # ── 尝试路径 2：X-API-Key（仅在 JWT 未认证成功时尝试）──────────────
+        if request.state.user is None:
+            raw_api_key: Optional[str] = request.headers.get("X-API-Key")
+            if raw_api_key:
+                await self._try_api_key(request, raw_api_key)
+
+        # ── 结构化日志（DEBUG 级别，不影响正常日志）────────────────────────
+        if request.state.user is not None:
+            _auth_mw_logger.debug(
+                "中间件认证成功 | method=%s | user_id=%s | role=%s | path=%s",
+                request.state.auth_method,
+                str(request.state.user.id),
+                request.state.user.role,
+                path,
+            )
+        elif request.state.auth_error:
+            _auth_mw_logger.debug(
+                "中间件认证失败（静默降级）| error=%s | path=%s",
+                request.state.auth_error,
+                path,
+            )
+
+        return await call_next(request)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 私有方法：JWT 认证探测
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _try_jwt(self, request: Request, token: str) -> None:
+        """
+        尝试解析并验证 JWT Token。
+
+        成功：将 User 对象写入 request.state.user，method 设为 "jwt"。
+        失败：记录 error 原因，user 保持 None，不抛出任何异常。
+
+        失败场景（全部静默处理，不影响请求继续）：
+          ① Token 签名错误 / 格式非法  → JWTError
+          ② Token 已过期              → ExpiredSignatureError
+          ③ Token 在 Redis 黑名单中   → HTTPException(401)
+          ④ Payload 中的 user_id 不存在于数据库
+          ⑤ 用户账号已被禁用
+          ⑥ 数据库连接失败
+        """
+        try:
+            # 调用 auth.py 中已定义的 verify_token（含黑名单检查）
+            payload = verify_token(token, expected_type="access")
+
+            # 从数据库加载最新用户状态（防止 Token 有效但账号已被禁用的情况）
+            user = await _load_user_by_id(payload.sub)
+            if user is None:
+                request.state.auth_error = "jwt_user_not_found_or_disabled"
+                return
+
+            _init_state(request, user=user, method="jwt", error=None)
+
+        except HTTPException as exc:
+            # verify_token 因 Token 在黑名单中抛出 401
+            request.state.auth_error = f"jwt_blacklisted: {exc.status_code}"
+
+        except Exception as exc:
+            # Token 格式错误、过期、签名失败等，全部静默
+            request.state.auth_error = f"jwt_invalid: {type(exc).__name__}"
+            _auth_mw_logger.debug(
+                "JWT 认证异常（静默）: %s — %s", type(exc).__name__, exc
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 私有方法：API Key 认证探测
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _try_api_key(self, request: Request, raw_key: str) -> None:
+        """
+        尝试验证 X-API-Key。
+
+        成功：将 User 对象写入 request.state.user，method 设为 "api_key"。
+        失败：记录 error 原因，user 保持 None，不抛出任何异常。
+
+        失败场景（全部静默处理）：
+          ① Key 格式错误（不以 _API_KEY_PREFIX 开头）
+          ② bcrypt checkpw 不匹配（Key 内容错误）
+          ③ Key 已禁用或已过期（is_valid() 返回 False）
+          ④ Key 关联的用户不存在或已被禁用
+          ⑤ 数据库连接失败
+        """
+        try:
+            from app.infrastructure.postgres_client import db_session
+            from sqlalchemy import select, update
+            from app.models.user import User
+            from app.models.user import APIKey
+            from datetime import datetime, timezone
+
+            async with db_session() as session:
+                # 调用 auth.py 中已定义的 verify_api_key
+                # 该函数内部含 bcrypt 验证 + is_valid() 检查 + last_used_at 更新
+                api_key_obj = await verify_api_key(raw_key, session)
+
+                # 加载关联用户（APIKey.user_id → User）
+                result = await session.execute(
+                    select(User).where(
+                        User.id == api_key_obj.user_id,
+                        User.is_active.is_(True),
+                        User.is_deleted.is_(False),
+                    )
+                )
+                user = result.scalar_one_or_none()
+
+            if user is None:
+                request.state.auth_error = "api_key_user_not_found_or_disabled"
+                return
+
+            _init_state(request, user=user, method="api_key", error=None)
+
+        except HTTPException as exc:
+            # verify_api_key 抛出 401 表示 Key 无效/不匹配
+            request.state.auth_error = f"api_key_invalid: {exc.status_code}"
+
+        except ImportError:
+            # PostgreSQL 客户端尚未就绪（Step 21 之前的开发阶段），降级跳过
+            request.state.auth_error = "api_key_db_not_ready"
+            _auth_mw_logger.debug("API Key 中间件：postgres_client 未就绪，跳过验证")
+
+        except Exception as exc:
+            request.state.auth_error = f"api_key_error: {type(exc).__name__}"
+            _auth_mw_logger.debug(
+                "API Key 认证异常（静默）: %s — %s", type(exc).__name__, exc
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 私有辅助函数（模块内共用，不对外暴露）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _init_state(
+    request: Request,
+    user,
+    method: str,
+    error: Optional[str],
+) -> None:
+    """
+    统一初始化 request.state 的认证字段，防止下游代码因属性不存在而报 AttributeError。
+
+    封装原因：中间件的 dispatch 方法中有多个分支都需要初始化 state，
+    提取为函数可以确保每次初始化都包含所有必要字段。
+    """
+    request.state.user = user
+    request.state.auth_method = method
+    request.state.auth_error = error
+
+
+async def _load_user_by_id(user_id_str: str):
+    """
+    根据 UUID 字符串从数据库查询用户（内部辅助函数）。
+
+    封装原因：JWT 认证和 API Key 认证都需要查询用户，抽取为公共函数避免重复。
+
+    Args:
+        user_id_str: UUID 字符串（来自 JWT payload.sub）
+
+    Returns:
+        User 对象（存在且启用）或 None
+    """
+    try:
+        from app.infrastructure.postgres_client import db_session
+        from sqlalchemy import select
+        from app.models.user import User
+
+        async with db_session() as session:
+            result = await session.execute(
+                select(User).where(
+                    User.id == uuid.UUID(user_id_str),
+                    User.is_active.is_(True),
+                    User.is_deleted.is_(False),
+                )
+            )
+            return result.scalar_one_or_none()
+
+    except ImportError:
+        # PostgreSQL 尚未就绪（早期开发阶段）
+        _auth_mw_logger.debug("_load_user_by_id: postgres_client 未就绪")
+        return None
+
+    except Exception as exc:
+        _auth_mw_logger.debug("_load_user_by_id 失败: %s", exc)
+        return None
